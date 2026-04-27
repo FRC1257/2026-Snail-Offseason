@@ -1,148 +1,138 @@
-// Copyright 2021-2024 FRC 6328
+// Copyright (c) 2021-2026 Littleton Robotics
 // http://github.com/Mechanical-Advantage
 //
-// This program is free software; you can redistribute it and/or
-// modify it under the terms of the GNU General Public License
-// version 3 as published by the Free Software Foundation or
-// available in the root directory of this project.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
+// Use of this source code is governed by a BSD
+// license that can be found in the LICENSE file
+// at the root directory of this project.
 
 package frc.robot.subsystems.drive;
 
-import static frc.robot.subsystems.drive.ModuleConstants.*;
-
+import com.ctre.phoenix6.configs.CANcoderConfiguration;
+import com.ctre.phoenix6.configs.TalonFXConfiguration;
+import com.ctre.phoenix6.swerve.SwerveModuleConstants;
 import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.controller.PIDController;
-import edu.wpi.first.math.controller.SimpleMotorFeedforward;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.system.plant.DCMotor;
 import edu.wpi.first.math.system.plant.LinearSystemId;
+import edu.wpi.first.math.util.Units;
 import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj.simulation.DCMotorSim;
-import frc.robot.Constants;
 
 /**
- * Physics sim implementation of module IO.
- *
- * <p>Uses two flywheel sims for the drive and turn motors, with the absolute position initialized
- * to a random value. The flywheel sims are not physically accurate, but provide a decent
- * approximation for the behavior of the module.
+ * Physics sim implementation of module IO. The sim models are configured using a set of module
+ * constants from Phoenix. Simulation is always based on voltage control.
  */
 public class ModuleIOSim implements ModuleIO {
-  private static final double LOOP_PERIOD_SECS = 0.02;
+  // TunerConstants doesn't support separate sim constants, so they are declared
+  // locally
+  private static final double DRIVE_KP = 0.05;
+  private static final double DRIVE_KD = 0.0;
+  private static final double DRIVE_KS = 0.0;
+  private static final double DRIVE_KV_ROT =
+      0.91035; // Same units as TunerConstants: (volt * secs) / rotation
+  private static final double DRIVE_KV = 1.0 / Units.rotationsToRadians(1.0 / DRIVE_KV_ROT);
+  private static final double TURN_KP = 8.0;
+  private static final double TURN_KD = 0.0;
+  private static final DCMotor DRIVE_GEARBOX = DCMotor.getKrakenX60Foc(1);
+  private static final DCMotor TURN_GEARBOX = DCMotor.getKrakenX60Foc(1);
 
-  private DCMotorSim driveSim =
-      new DCMotorSim(
-          LinearSystemId.createDCMotorSystem(DCMotor.getNEO(1), 0.025, 4.71), DCMotor.getNEO(1));
-  private DCMotorSim turnSim =
-      new DCMotorSim(
-          LinearSystemId.createDCMotorSystem(DCMotor.getNeo550(1), 0.004, 150.0 / 7.0),
-          DCMotor.getNeo550(1));
+  private final DCMotorSim driveSim;
+  private final DCMotorSim turnSim;
 
-  private final Rotation2d turnAbsoluteInitPosition =
-      new Rotation2d(); // new Rotation2d(Math.random() * 2.0 * Math.PI);
+  private boolean driveClosedLoop = false;
+  private boolean turnClosedLoop = false;
+  private PIDController driveController = new PIDController(DRIVE_KP, 0, DRIVE_KD);
+  private PIDController turnController = new PIDController(TURN_KP, 0, TURN_KD);
+  private double driveFFVolts = 0.0;
   private double driveAppliedVolts = 0.0;
   private double turnAppliedVolts = 0.0;
 
-  private final SimpleMotorFeedforward driveFeedforward = new SimpleMotorFeedforward(0.0, 0.13);
-  private final SimpleMotorFeedforward turnFeedforward = new SimpleMotorFeedforward(0.0, 0.0);
-  private final PIDController driveFeedback = new PIDController(0.1, 0.0, 0.0);
-  private final PIDController turnFeedback = new PIDController(10.0, 0.0, 0.0);
+  public ModuleIOSim(
+      SwerveModuleConstants<TalonFXConfiguration, TalonFXConfiguration, CANcoderConfiguration>
+          constants) {
+    // Create drive and turn sim models
+    driveSim =
+        new DCMotorSim(
+            LinearSystemId.createDCMotorSystem(
+                DRIVE_GEARBOX, constants.DriveInertia, constants.DriveMotorGearRatio),
+            DRIVE_GEARBOX);
+    turnSim =
+        new DCMotorSim(
+            LinearSystemId.createDCMotorSystem(
+                TURN_GEARBOX, constants.SteerInertia, constants.SteerMotorGearRatio),
+            TURN_GEARBOX);
 
-  private double lastTurnSetpoint = 0;
-  private double lastTime = Timer.getFPGATimestamp();
-
-  public ModuleIOSim() {
-    turnFeedback.enableContinuousInput(0, 2 * Constants.PI);
+    // Enable wrapping for turn PID
+    turnController.enableContinuousInput(-Math.PI, Math.PI);
   }
 
   @Override
   public void updateInputs(ModuleIOInputs inputs) {
-    driveSim.update(LOOP_PERIOD_SECS);
-    turnSim.update(LOOP_PERIOD_SECS);
+    // Run closed-loop control
+    if (driveClosedLoop) {
+      driveAppliedVolts =
+          driveFFVolts + driveController.calculate(driveSim.getAngularVelocityRadPerSec());
+    } else {
+      driveController.reset();
+    }
+    if (turnClosedLoop) {
+      turnAppliedVolts = turnController.calculate(turnSim.getAngularPositionRad());
+    } else {
+      turnController.reset();
+    }
 
+    // Update simulation state
+    driveSim.setInputVoltage(MathUtil.clamp(driveAppliedVolts, -12.0, 12.0));
+    turnSim.setInputVoltage(MathUtil.clamp(turnAppliedVolts, -12.0, 12.0));
+    driveSim.update(0.02);
+    turnSim.update(0.02);
+
+    // Update drive inputs
+    inputs.driveConnected = true;
     inputs.drivePositionRad = driveSim.getAngularPositionRad();
-    inputs.drivePositionMeters = driveSim.getAngularPositionRad() * kWheelRadiusMeters;
     inputs.driveVelocityRadPerSec = driveSim.getAngularVelocityRadPerSec();
-    inputs.driveVelocityMeterPerSec = driveSim.getAngularVelocityRadPerSec() * kWheelRadiusMeters;
     inputs.driveAppliedVolts = driveAppliedVolts;
     inputs.driveCurrentAmps = Math.abs(driveSim.getCurrentDrawAmps());
 
-    inputs.turnAbsolutePosition =
-        new Rotation2d(turnSim.getAngularPositionRad()).plus(turnAbsoluteInitPosition);
+    // Update turn inputs
+    inputs.turnConnected = true;
+    inputs.turnEncoderConnected = true;
+    inputs.turnAbsolutePosition = new Rotation2d(turnSim.getAngularPositionRad());
     inputs.turnPosition = new Rotation2d(turnSim.getAngularPositionRad());
     inputs.turnVelocityRadPerSec = turnSim.getAngularVelocityRadPerSec();
     inputs.turnAppliedVolts = turnAppliedVolts;
     inputs.turnCurrentAmps = Math.abs(turnSim.getCurrentDrawAmps());
 
+    // Update odometry inputs (50Hz because high-frequency odometry in sim doesn't
+    // matter)
     inputs.odometryTimestamps = new double[] {Timer.getFPGATimestamp()};
     inputs.odometryDrivePositionsRad = new double[] {inputs.drivePositionRad};
     inputs.odometryTurnPositions = new Rotation2d[] {inputs.turnPosition};
   }
 
   @Override
-  public void setDriveVoltage(double volts) {
-    driveAppliedVolts = MathUtil.clamp(volts, -12.0, 12.0);
-    driveSim.setInputVoltage(driveAppliedVolts);
+  public void setDriveOpenLoop(double output) {
+    driveClosedLoop = false;
+    driveAppliedVolts = output;
   }
 
   @Override
-  public void setTurnVoltage(double volts) {
-    turnAppliedVolts = MathUtil.clamp(volts, -12.0, 12.0);
-    turnSim.setInputVoltage(turnAppliedVolts);
+  public void setTurnOpenLoop(double output) {
+    turnClosedLoop = false;
+    turnAppliedVolts = output;
   }
 
   @Override
   public void setDriveVelocity(double velocityRadPerSec) {
-    setDriveVoltage(
-        driveFeedforward.calculate(velocityRadPerSec)
-            + driveFeedback.calculate(driveSim.getAngularVelocityRadPerSec(), velocityRadPerSec));
+    driveClosedLoop = true;
+    driveFFVolts = DRIVE_KS * Math.signum(velocityRadPerSec) + DRIVE_KV * velocityRadPerSec;
+    driveController.setSetpoint(velocityRadPerSec);
   }
 
   @Override
-  public void setTurnPosition(double angle) {
-    double dtheta = angle - lastTurnSetpoint;
-    if (dtheta > Constants.PI) {
-      dtheta -= 2 * Constants.PI;
-    } else if (dtheta < -Constants.PI) {
-      dtheta += 2 * Constants.PI;
-    }
-
-    double setpointVelocity = dtheta / (Timer.getFPGATimestamp() - lastTime);
-    lastTime = Timer.getFPGATimestamp();
-    lastTurnSetpoint = angle;
-    double ffOutput = turnFeedforward.calculate(setpointVelocity);
-    setTurnVoltage(turnFeedback.calculate(turnSim.getAngularPositionRad(), angle) + ffOutput);
-  }
-
-  @Override
-  public void setDrivePID(double p, double i, double d) {
-    driveFeedback.setPID(p, i, d);
-  }
-
-  @Override
-  public void setDriveFF(double kS, double kV) {
-    driveFeedforward.setKs(kS);
-    driveFeedforward.setKv(kV);
-  }
-
-  @Override
-  public void setTurnPID(double p, double i, double d) {
-    turnFeedback.setPID(p, i, d);
-  }
-
-  @Override
-  public void setTurnFF(double kS, double kV) {
-    turnFeedforward.setKs(kS);
-    turnFeedforward.setKv(kV);
-  }
-
-  @Override
-  public double getTurnPositionError(double angle) {
-    return turnFeedback.getPositionError();
+  public void setTurnPosition(Rotation2d rotation) {
+    turnClosedLoop = true;
+    turnController.setSetpoint(rotation.getRadians());
   }
 }

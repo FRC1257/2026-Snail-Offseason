@@ -14,7 +14,6 @@ import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import frc.robot.Energy.BatteryLogger;
 import frc.robot.util.drive.AllianceFlipUtil;
-import frc.robot.util.drive.DriveControls;
 import frc.robot.util.misc.Elastic;
 
 import org.littletonrobotics.junction.AutoLog;
@@ -104,7 +103,7 @@ public class Robot extends LoggedRobot {
     FollowPathCommand.warmupCommand().schedule();
 
     // Initializes driver and operator choosers
-    DriveControls.updateDriverAndOperator();
+    
   }
 
   /** This function is called periodically during all modes. */
@@ -177,7 +176,7 @@ public class Robot extends LoggedRobot {
 
     // Configures controls once at the start of teleop
     if (!controlsConfigured) {
-      robotContainer.configureButtonBindings();
+      //robotContainer.configureButtonBindings();
       controlsConfigured = true;
     }
   }

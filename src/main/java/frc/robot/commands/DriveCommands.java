@@ -1,70 +1,61 @@
-// Copyright 2021-2024 FRC 6328
+// Copyright (c) 2021-2026 Littleton Robotics
 // http://github.com/Mechanical-Advantage
 //
-// This program is free software; you can redistribute it and/or
-// modify it under the terms of the GNU General Public License
-// version 3 as published by the Free Software Foundation or
-// available in the root directory of this project.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
+// Use of this source code is governed by a BSD
+// license that can be found in the LICENSE file
+// at the root directory of this project.
 
 package frc.robot.commands;
 
-import static frc.robot.subsystems.drive.DriveConstants.kSlowModeConstant;
-import static frc.robot.subsystems.drive.DriveConstants.kTurnAngleD;
-import static frc.robot.subsystems.drive.DriveConstants.kTurnAngleI;
-import static frc.robot.subsystems.drive.DriveConstants.kTurnAngleP;
-
 import edu.wpi.first.math.MathUtil;
-import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.math.controller.ProfiledPIDController;
 import edu.wpi.first.math.filter.SlewRateLimiter;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.geometry.Transform2d;
 import edu.wpi.first.math.geometry.Translation2d;
 import edu.wpi.first.math.kinematics.ChassisSpeeds;
+import edu.wpi.first.math.trajectory.TrapezoidProfile;
 import edu.wpi.first.math.util.Units;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
 import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.Commands;
-import edu.wpi.first.wpilibj2.command.InstantCommand;
-import frc.robot.Constants;
-import frc.robot.FieldConstants;
-import frc.robot.FieldConstants.Hub;
 import frc.robot.subsystems.drive.Drive;
-import frc.robot.subsystems.drive.DriveConstants;
-import frc.robot.util.drive.AllianceFlipUtil;
 import java.text.DecimalFormat;
 import java.text.NumberFormat;
-import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.function.DoubleSupplier;
 import java.util.function.Supplier;
-import org.littletonrobotics.junction.Logger;
-import org.littletonrobotics.junction.networktables.LoggedNetworkBoolean;
 
 public class DriveCommands {
   private static final double DEADBAND = 0.1;
+  private static final double ANGLE_KP = 5.0;
+  private static final double ANGLE_KD = 0.4;
+  private static final double ANGLE_MAX_VELOCITY = 8.0;
+  private static final double ANGLE_MAX_ACCELERATION = 20.0;
   private static final double FF_START_DELAY = 2.0; // Secs
   private static final double FF_RAMP_RATE = 0.1; // Volts/Sec
   private static final double WHEEL_RADIUS_MAX_VELOCITY = 0.25; // Rad/Sec
   private static final double WHEEL_RADIUS_RAMP_RATE = 0.05; // Rad/Sec^2
-  private static double slowMode = 1;
-  // kSlowModeConstant;
 
-  private static PIDController angleController =
-      new PIDController(kTurnAngleP, kTurnAngleI, kTurnAngleD);
-  private static LoggedNetworkBoolean shootSide =
-      new LoggedNetworkBoolean("/SmartDashboard/ShootSide", false);
+  private DriveCommands() {}
 
-  private static Rotation2d lastRotation = new Rotation2d();
-  private static double lastTime = Timer.getFPGATimestamp();
+  private static Translation2d getLinearVelocityFromJoysticks(double x, double y) {
+    // Apply deadband
+    double linearMagnitude = MathUtil.applyDeadband(Math.hypot(x, y), DEADBAND);
+    Rotation2d linearDirection = new Rotation2d(Math.atan2(y, x));
+
+    // Square magnitude for more precise control
+    linearMagnitude = linearMagnitude * linearMagnitude;
+
+    // Return new linear velocity
+    return new Pose2d(Translation2d.kZero, linearDirection)
+        .transformBy(new Transform2d(linearMagnitude, 0.0, Rotation2d.kZero))
+        .getTranslation();
+  }
 
   /**
    * Field relative drive command using two joysticks (controlling linear and angular velocities).
@@ -76,40 +67,28 @@ public class DriveCommands {
       DoubleSupplier omegaSupplier) {
     return Commands.run(
         () -> {
-          // Apply deadband
-          double linearMagnitude =
-              MathUtil.applyDeadband(
-                  Math.hypot(xSupplier.getAsDouble(), ySupplier.getAsDouble()), DEADBAND);
-          Rotation2d linearDirection =
-              new Rotation2d(xSupplier.getAsDouble(), ySupplier.getAsDouble());
+          // Get linear velocity
+          Translation2d linearVelocity =
+              getLinearVelocityFromJoysticks(xSupplier.getAsDouble(), ySupplier.getAsDouble());
+
+          // Apply rotation deadband
           double omega = MathUtil.applyDeadband(omegaSupplier.getAsDouble(), DEADBAND);
 
-          // Normalize magnitude of velocity vector if it is greater than 1
-          if (linearMagnitude > 1) {
-            linearMagnitude = 1;
-          }
-
-          // Multiply by slow mode factor
-          linearMagnitude *= slowMode;
-          omega *= slowMode;
-
-          // Square values
-          linearMagnitude = linearMagnitude * linearMagnitude;
+          // Square rotation value for more precise control
           omega = Math.copySign(omega * omega, omega);
 
-          // Calcaulate new linear velocity
-          Translation2d linearVelocity =
-              new Pose2d(new Translation2d(), linearDirection)
-                  .transformBy(new Transform2d(linearMagnitude, 0.0, new Rotation2d()))
-                  .getTranslation();
-
           // Convert to field relative speeds & send command
-          boolean isFlipped = getIsFlipped();
-          drive.runVelocity(
-              ChassisSpeeds.fromFieldRelativeSpeeds(
+          ChassisSpeeds speeds =
+              new ChassisSpeeds(
                   linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
                   linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
-                  omega * drive.getMaxAngularSpeedRadPerSec(),
+                  omega * drive.getMaxAngularSpeedRadPerSec());
+          boolean isFlipped =
+              DriverStation.getAlliance().isPresent()
+                  && DriverStation.getAlliance().get() == Alliance.Red;
+          drive.runVelocity(
+              ChassisSpeeds.fromFieldRelativeSpeeds(
+                  speeds,
                   isFlipped
                       ? drive.getRotation().plus(new Rotation2d(Math.PI))
                       : drive.getRotation()));
@@ -118,203 +97,57 @@ public class DriveCommands {
   }
 
   /**
-   * Robot relative drive command using two joysticks (controlling linear and angular velocities).
+   * Field relative drive command using joystick for linear control and PID for angular control.
+   * Possible use cases include snapping to an angle, aiming at a vision target, or controlling
+   * absolute rotation with a joystick.
    */
-  public static Command joystickDriveRobotRelative(
+  public static Command joystickDriveAtAngle(
       Drive drive,
       DoubleSupplier xSupplier,
       DoubleSupplier ySupplier,
-      DoubleSupplier omegaSupplier) {
-    return Commands.run(
-        () -> {
-          // Apply deadband
-          double linearMagnitude =
-              MathUtil.applyDeadband(
-                  Math.hypot(xSupplier.getAsDouble(), ySupplier.getAsDouble()), DEADBAND);
-          Rotation2d linearDirection =
-              new Rotation2d(xSupplier.getAsDouble(), ySupplier.getAsDouble());
-          double omega = MathUtil.applyDeadband(omegaSupplier.getAsDouble(), DEADBAND);
+      Supplier<Rotation2d> rotationSupplier) {
 
-          // Normalize magnitude of velocity vector if it is greater than 1
-          if (linearMagnitude > 1) {
-            linearMagnitude = 1;
-          }
-
-          // Multiply by slow mode factor
-          linearMagnitude *= slowMode;
-          omega *= slowMode;
-
-          // Square values
-          linearMagnitude = linearMagnitude * linearMagnitude;
-          omega = Math.copySign(omega * omega, omega);
-
-          // Calcaulate new linear velocity
-          Translation2d linearVelocity =
-              new Pose2d(new Translation2d(), linearDirection)
-                  .transformBy(new Transform2d(linearMagnitude, 0.0, new Rotation2d()))
-                  .getTranslation();
-
-          // Convert to robot relative speeds & send command
-          drive.runVelocity(
-              ChassisSpeeds.fromRobotRelativeSpeeds(
-                  linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
-                  linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
-                  omega * drive.getMaxAngularSpeedRadPerSec(),
-                  new Rotation2d()));
-        },
-        drive);
-  }
-
-  /** Drive robot while pointing to the closest reef face. */
-  // This function checks which face robot is closest to and updates rotation based on that
-  // public static Command joystickReefPoint(
-  //     Drive drive, DoubleSupplier xSupplier, DoubleSupplier ySupplier) {
-  //   return joystickAnglePoint(
-  //       drive,
-  //       xSupplier,
-  //       ySupplier,
-  //       () -> {
-  //         // Positions of the centers of each reef face
-  //         Pose2d[] reefFacePositions = FieldConstants.Reef.centerFaces;
-
-  //         // closestDistance represents the distance to the closest face
-  //         // closestFace represents the index of the closest face
-  //         double closestDistance = Double.MAX_VALUE;
-  //         int closestFace = 0;
-
-  //         // Goes through all reef face positions and checks which one is closest
-  //         for (int i = 0; i < 6; i++) {
-  //           Pose2d reefPosition = AllianceFlipUtil.apply(reefFacePositions[i]);
-
-  //           Transform2d robotToReefFace = reefPosition.minus(drive.getPose());
-
-  //           if (robotToReefFace.getTranslation().getNorm() < closestDistance) {
-  //             closestDistance = robotToReefFace.getTranslation().getNorm();
-  //             closestFace = i;
-  //           }
-  //         }
-
-  //         // Returns desired angle based on which face is closest
-  //         Logger.recordOutput("Closest Reef Face", closestFace);
-  //         Logger.recordOutput("Closest Reef Distance", closestDistance);
-  //         return AllianceFlipUtil.apply(Rotation2d.fromDegrees(-60 * closestFace));
-  //       });
-  // }
-
-  public static Command joystickStationPoint(
-      Drive drive, DoubleSupplier xSupplier, DoubleSupplier ySupplier) {
-    return joystickAnglePoint(
-        drive,
-        xSupplier,
-        ySupplier,
-        () -> {
-          Pose2d currentPose = AllianceFlipUtil.apply(drive.getPose());
-          Rotation2d targetRotation = AllianceFlipUtil.apply(Rotation2d.fromDegrees(-125.989));
-          if (currentPose.getY() > FieldConstants.fieldWidth / 2) {
-            targetRotation = AllianceFlipUtil.apply(Rotation2d.fromDegrees(125.989));
-          }
-          return targetRotation;
-        });
-  }
-
-  public static Command joystickProcessorPoint(
-      Drive drive, DoubleSupplier xSupplier, DoubleSupplier ySupplier) {
-    return joystickAnglePoint(
-        drive, xSupplier, ySupplier, () -> AllianceFlipUtil.apply(Rotation2d.fromDegrees(90)));
-  }
-
-  
-
-  private static boolean getIsFlipped() {
-    return DriverStation.getAlliance().isPresent()
-        && DriverStation.getAlliance().get() == Alliance.Red;
-  }
-
-  /** Drive robot while pointing at a specific point on the field. */
-  public static Command joystickAnglePoint(
-      Drive drive,
-      DoubleSupplier xSupplier,
-      DoubleSupplier ySupplier,
-      Supplier<Rotation2d> targetDirection) {
+    // Create PID controller
+    ProfiledPIDController angleController =
+        new ProfiledPIDController(
+            ANGLE_KP,
+            0.0,
+            ANGLE_KD,
+            new TrapezoidProfile.Constraints(ANGLE_MAX_VELOCITY, ANGLE_MAX_ACCELERATION));
     angleController.enableContinuousInput(-Math.PI, Math.PI);
+
+    // Construct command
     return Commands.run(
-        () -> {
-          // Apply deadband
-          double linearMagnitude =
-              MathUtil.applyDeadband(
-                  Math.hypot(xSupplier.getAsDouble(), ySupplier.getAsDouble()), DEADBAND);
-          Rotation2d linearDirection =
-              new Rotation2d(xSupplier.getAsDouble(), ySupplier.getAsDouble());
+            () -> {
+              // Get linear velocity
+              Translation2d linearVelocity =
+                  getLinearVelocityFromJoysticks(xSupplier.getAsDouble(), ySupplier.getAsDouble());
 
-          // Normalize magnitude of velocity vector if it is greater than 1
-          if (linearMagnitude > 1) {
-            linearMagnitude = 1;
-          }
+              // Calculate angular speed
+              double omega =
+                  angleController.calculate(
+                      drive.getRotation().getRadians(), rotationSupplier.get().getRadians());
 
-          // Multiply by slow mode factor
-          linearMagnitude *= slowMode;
+              // Convert to field relative speeds & send command
+              ChassisSpeeds speeds =
+                  new ChassisSpeeds(
+                      linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
+                      linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
+                      omega);
+              boolean isFlipped =
+                  DriverStation.getAlliance().isPresent()
+                      && DriverStation.getAlliance().get() == Alliance.Red;
+              drive.runVelocity(
+                  ChassisSpeeds.fromFieldRelativeSpeeds(
+                      speeds,
+                      isFlipped
+                          ? drive.getRotation().plus(new Rotation2d(Math.PI))
+                          : drive.getRotation()));
+            },
+            drive)
 
-          double omega =
-              angleController.calculate(
-                  MathUtil.angleModulus(drive.getRotation().getRadians()),
-                  targetDirection.get().getRadians());
-
-          // Square values
-          linearMagnitude = linearMagnitude * linearMagnitude;
-
-          // Calcaulate new linear velocity
-          Translation2d linearVelocity =
-              new Pose2d(new Translation2d(), linearDirection)
-                  .transformBy(new Transform2d(linearMagnitude, 0.0, new Rotation2d()))
-                  .getTranslation();
-
-          // Convert to robot relative speeds & send command
-          drive.runVelocity(
-              ChassisSpeeds.fromFieldRelativeSpeeds(
-                  linearVelocity.getX() * drive.getMaxLinearSpeedMetersPerSec(),
-                  linearVelocity.getY() * drive.getMaxLinearSpeedMetersPerSec(),
-                  MathUtil.clamp(
-                      omega * drive.getMaxAngularSpeedRadPerSec(),
-                      -DriveConstants.kAlignMaxAngularSpeed,
-                      DriveConstants.kAlignMaxAngularSpeed),
-                  getIsFlipped()
-                      ? drive.getRotation().plus(new Rotation2d(Math.PI))
-                      : drive.getRotation()));
-        },
-        drive);
-  }
-
-  public static Command joystickHubPoint(Drive drive, DoubleSupplier xSupplier, DoubleSupplier ySupplier) {
-    return joystickAnglePoint(drive, xSupplier, ySupplier, () -> {
-      Pose2d currentPose = drive.getPose();
-      Translation2d targetPose = AllianceFlipUtil.apply(Hub.topCenterPoint.toTranslation2d());
-      Rotation2d rotationSupplier = new Rotation2d(targetPose.getX()-currentPose.getX(), targetPose.getY() - currentPose.getY());
-      return rotationSupplier;
-    });
-  }
-
-  public static Command alignToTrench(Drive drive) {
-    return new AlignToPose(
-      drive,
-      () -> {
-        List<Pose2d> trenchPoses = List.of(
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(12).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(1).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(7).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(6).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(17).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(28).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(22).get().toPose2d(),
-          FieldConstants.AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(23).get().toPose2d());
-        
-        List<Pose2d> allPoses = new ArrayList<>(trenchPoses);
-        for(Pose2d pose: trenchPoses) {
-          allPoses.add(new Pose2d(pose.getTranslation(), pose.getRotation().rotateBy(Rotation2d.fromDegrees(180))));
-        }
-        
-        return drive.getPose().nearest(allPoses);
-      }, false);
-
+        // Reset PID controller when command starts
+        .beforeStarting(() -> angleController.reset(drive.getRotation().getRadians()));
   }
 
   /**
@@ -351,7 +184,7 @@ public class DriveCommands {
                 () -> {
                   double voltage = timer.get() * FF_RAMP_RATE;
                   drive.runCharacterization(voltage);
-                  velocitySamples.add(drive.getCharacterizationVelocity());
+                  velocitySamples.add(drive.getFFCharacterizationVelocity());
                   voltageSamples.add(voltage);
                 },
                 drive)
@@ -449,25 +282,9 @@ public class DriveCommands {
                     })));
   }
 
-  /** Toggle Slow Mode */
-  public static void toggleSlowMode() {
-    if (slowMode == 1) {
-      slowMode = kSlowModeConstant;
-    } else {
-      slowMode = 1;
-    }
-  }
-
-  public static boolean getPivotSideAngle() {
-    if (shootSide.get()) {
-      return false;
-    }
-    return true;
-  }
-
   private static class WheelRadiusCharacterizationState {
     double[] positions = new double[4];
-    Rotation2d lastAngle = new Rotation2d();
+    Rotation2d lastAngle = Rotation2d.kZero;
     double gyroDelta = 0.0;
   }
 }
